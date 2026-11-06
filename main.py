@@ -1,8 +1,8 @@
 """MisterAI backend (FastAPI).
 
-Orquesta la subida de vídeos a Cloudflare R2 (multipart con URLs firmadas) y
-registra los partidos en Supabase. No procesa vídeo: eso lo hace el worker de Modal.
-Toda la configuración llega por variables de entorno (ver .env.example).
+Orquesta la subida de vídeos a Cloudflare R2 (multipart con URLs firmadas), registra los partidos
+en Supabase y avisa al worker de Modal cuando un partido está listo para analizarse.
+No procesa vídeo. Toda la configuración llega por variables de entorno (ver .env.example).
 """
 import math
 import os
@@ -12,7 +12,7 @@ import boto3
 import httpx
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -33,6 +33,10 @@ MAX_FILE_BYTES = int(env("MAX_FILE_GB", "6")) * 1024**3
 PART_SIZE = 64 * 1024**2          # 64 MB por trozo (R2 exige >= 5 MB salvo el último)
 URL_TTL = int(env("URL_TTL_SECONDS", "3600"))
 ALLOWED_EXT = {"mp4", "mov", "m4v"}
+
+# Worker de Modal (opcionales: si faltan, el partido queda 'pendiente' sin avisar)
+WORKER_URL = env("WORKER_URL", "").rstrip("/")
+WORKER_TOKEN = env("WORKER_TOKEN", "")
 
 s3 = boto3.client(
     "s3",
@@ -100,6 +104,21 @@ def require_own_key(key: str, user_id: str) -> None:
     """Un usuario solo puede tocar objetos de su propia carpeta en R2."""
     if not key.startswith(f"{user_id}/") or ".." in key:
         raise HTTPException(403, "Clave de vídeo no permitida")
+
+
+def avisar_worker(partido_id: str) -> None:
+    """Avisa al worker de Modal. Si falla, el partido se queda en 'pendiente' y se puede relanzar."""
+    if not WORKER_URL or not WORKER_TOKEN:
+        return
+    try:
+        httpx.post(
+            f"{WORKER_URL}/procesar",
+            json={"partido_id": partido_id},
+            headers={"x-worker-token": WORKER_TOKEN},
+            timeout=60,  # el primer arranque del contenedor de Modal puede tardar
+        )
+    except httpx.HTTPError:
+        pass
 
 
 # ---------- Modelos ----------
@@ -170,8 +189,8 @@ def upload_init(body: InitReq, user_id: str = Depends(current_user)):
 
 
 @app.post("/api/upload/complete")
-def upload_complete(body: CompleteReq, user_id: str = Depends(current_user)):
-    """Cierra la subida en R2 y registra el partido como 'pendiente' en Supabase."""
+def upload_complete(body: CompleteReq, background: BackgroundTasks, user_id: str = Depends(current_user)):
+    """Cierra la subida en R2, registra el partido como 'pendiente' y avisa al worker."""
     require_own_key(body.key, user_id)
     parts = sorted(body.parts, key=lambda p: p.PartNumber)
     try:
@@ -198,7 +217,7 @@ def upload_complete(body: CompleteReq, user_id: str = Depends(current_user)):
         "tamano_bytes": size,
         "estado_analisis": "pendiente",
     })
-    # TODO: lanzar aquí el procesamiento en Modal (worker de IA).
+    background.add_task(avisar_worker, partido["id"])  # responde ya; el aviso se hace después
     return {"duplicado": False, "partido": partido}
 
 
