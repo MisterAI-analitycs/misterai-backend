@@ -100,6 +100,15 @@ def insert_partido(row: dict) -> dict:
     return r.json()[0]
 
 
+def update_partido(partido_id: str, fields: dict) -> dict:
+    headers = {**admin_headers(), "Prefer": "return=representation"}
+    r = httpx.patch(f"{SUPABASE_URL}/rest/v1/partidos", params={"id": f"eq.{partido_id}"},
+                    json=fields, headers=headers, timeout=10)
+    if r.status_code >= 300 or not r.json():
+        raise HTTPException(502, "No se pudo actualizar el partido")
+    return r.json()[0]
+
+
 def require_own_key(key: str, user_id: str) -> None:
     """Un usuario solo puede tocar objetos de su propia carpeta en R2."""
     if not key.startswith(f"{user_id}/") or ".." in key:
@@ -165,7 +174,8 @@ def upload_init(body: InitReq, user_id: str = Depends(current_user)):
 
     if body.huella:
         dup = find_duplicate(user_id, body.huella)
-        if dup:
+        # Si el intento anterior terminó en error, se permite volver a subir y analizar el vídeo.
+        if dup and dup.get("estado_analisis") != "error":
             return {"duplicado": True, "partido": dup}
 
     key = f"{user_id}/{uuid.uuid4().hex}.{ext}"
@@ -208,15 +218,21 @@ def upload_complete(body: CompleteReq, background: BackgroundTasks, user_id: str
         s3.delete_object(Bucket=R2_BUCKET, Key=body.key)
         raise HTTPException(413, "El vídeo supera el tamaño máximo")
 
-    partido = insert_partido({
-        "user_id": user_id,
+    campos = {
         "nombre": body.nombre.strip() or "Partido sin nombre",
         "modalidad": body.modalidad,
         "file_path": body.key,
         "huella": body.huella,
         "tamano_bytes": size,
         "estado_analisis": "pendiente",
-    })
+        "resultados": None,
+    }
+    # Si el mismo vídeo ya falló antes, se reutiliza su fila en lugar de crear otra en el historial.
+    previo = find_duplicate(user_id, body.huella) if body.huella else None
+    if previo and previo.get("estado_analisis") == "error":
+        partido = update_partido(previo["id"], campos)
+    else:
+        partido = insert_partido({"user_id": user_id, **campos})
     background.add_task(avisar_worker, partido["id"])  # responde ya; el aviso se hace después
     return {"duplicado": False, "partido": partido}
 
