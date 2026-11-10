@@ -1,12 +1,14 @@
 """MisterAI backend (FastAPI).
 
 Orquesta la subida de vídeos a Cloudflare R2 (multipart con URLs firmadas), registra los partidos
-en Supabase y avisa al worker de Modal cuando un partido está listo para analizarse.
-No procesa vídeo. Toda la configuración llega por variables de entorno (ver .env.example).
+en Supabase, avisa al worker de Modal cuando un partido está listo para analizarse y entrega
+los clips de cada partido con enlaces temporales. No procesa vídeo.
+Toda la configuración llega por variables de entorno (ver .env.example).
 """
 import math
 import os
 import uuid
+from datetime import datetime, timezone
 
 import boto3
 import httpx
@@ -245,3 +247,42 @@ def upload_abort(body: AbortReq, user_id: str = Depends(current_user)):
     except ClientError:
         pass  # si ya no existe, da igual
     return {"ok": True}
+
+
+@app.get("/api/partidos/{partido_id}/clips")
+def listar_clips(partido_id: str, user_id: str = Depends(current_user)):
+    """Clips de un partido con enlaces firmados temporales. Solo el propietario; caducan a las 72 h."""
+    try:
+        uuid.UUID(partido_id)
+    except ValueError:
+        raise HTTPException(400, "Identificador no válido")
+
+    r = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/partidos",
+        params={"id": f"eq.{partido_id}", "user_id": f"eq.{user_id}", "select": "resultados", "limit": "1"},
+        headers=admin_headers(),
+        timeout=10,
+    )
+    r.raise_for_status()
+    rows = r.json()
+    if not rows:
+        raise HTTPException(404, "Partido no encontrado")
+
+    ahora = datetime.now(timezone.utc)
+    salida = []
+    for c in (rows[0].get("resultados") or {}).get("clips", []):
+        key = c.get("key", "")
+        try:
+            vigente = datetime.fromisoformat(c["expira"]) > ahora
+        except (KeyError, ValueError):
+            vigente = False
+        if not vigente or not key.startswith(f"clips/{partido_id}/"):
+            continue
+        try:
+            s3.head_object(Bucket=R2_BUCKET, Key=key)
+        except ClientError:
+            continue  # ya no existe en R2
+        url = s3.generate_presigned_url("get_object", Params={"Bucket": R2_BUCKET, "Key": key}, ExpiresIn=URL_TTL)
+        salida.append({"n": c.get("n"), "titulo": c.get("titulo"), "inicio_s": c.get("inicio_s"),
+                       "fin_s": c.get("fin_s"), "expira": c["expira"], "url": url})
+    return {"clips": salida}
